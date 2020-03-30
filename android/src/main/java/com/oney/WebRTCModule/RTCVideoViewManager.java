@@ -1,11 +1,9 @@
 package com.oney.WebRTCModule;
 
-import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.uimanager.annotations.ReactProp;
 import com.facebook.react.uimanager.SimpleViewManager;
 import com.facebook.react.uimanager.ThemedReactContext;
 
-import org.webrtc.MediaStream;
 
 public class RTCVideoViewManager extends SimpleViewManager<WebRTCView> {
   private static final String REACT_CLASS = "RTCVideoView";
@@ -56,15 +54,7 @@ public class RTCVideoViewManager extends SimpleViewManager<WebRTCView> {
 
   @ReactProp(name = "streamURL")
   public void setStreamURL(WebRTCView view, String streamURL) {
-    MediaStream mediaStream;
-    if (streamURL == null) {
-      mediaStream = null;
-    } else {
-      ReactContext reactContext = (ReactContext) view.getContext();
-      WebRTCModule module = reactContext.getNativeModule(WebRTCModule.class);
-      mediaStream = module.getStreamForReactTag(streamURL);
-    }
-    view.setStream(mediaStream);
+    view.setStreamURL(streamURL);
   }
 
   /**

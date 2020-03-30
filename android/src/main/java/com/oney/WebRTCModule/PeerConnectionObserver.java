@@ -3,9 +3,12 @@ package com.oney.WebRTCModule;
 import java.io.UnsupportedEncodingException;
 import java.lang.ref.SoftReference;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import android.support.annotation.Nullable;
 import android.util.Base64;
@@ -14,7 +17,6 @@ import android.util.SparseArray;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Callback;
-import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
@@ -37,8 +39,10 @@ class PeerConnectionObserver implements PeerConnection.Observer {
         = new SparseArray<DataChannel>();
     private final int id;
     private PeerConnection peerConnection;
+    final List<MediaStream> localStreams;
     final Map<String, MediaStream> remoteStreams;
     final Map<String, MediaStreamTrack> remoteTracks;
+    private final VideoTrackAdapter videoTrackAdapters;
     private final WebRTCModule webRTCModule;
 
     /**
@@ -48,13 +52,52 @@ class PeerConnectionObserver implements PeerConnection.Observer {
      * buffer in an attempt to improve performance.
      */
     private SoftReference<StringBuilder> statsToJSONStringBuilder
-        = new SoftReference(null);
+        = new SoftReference<>(null);
 
     PeerConnectionObserver(WebRTCModule webRTCModule, int id) {
         this.webRTCModule = webRTCModule;
         this.id = id;
+        this.localStreams = new ArrayList<MediaStream>();
         this.remoteStreams = new HashMap<String, MediaStream>();
         this.remoteTracks = new HashMap<String, MediaStreamTrack>();
+        this.videoTrackAdapters = new VideoTrackAdapter(webRTCModule, id);
+    }
+
+    /**
+     * Adds a specific local <tt>MediaStream</tt> to the associated
+     * <tt>PeerConnection</tt>.
+     *
+     * @param localStream the local <tt>MediaStream</tt> to add to the
+     * associated <tt>PeerConnection</tt>
+     * @return <tt>true</tt> if the specified <tt>localStream</tt> was added to
+     * the associated <tt>PeerConnection</tt>; otherwise, <tt>false</tt>
+     */
+    boolean addStream(MediaStream localStream) {
+        if (peerConnection != null && peerConnection.addStream(localStream)) {
+            localStreams.add(localStream);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Removes a specific local <tt>MediaStream</tt> from the associated
+     * <tt>PeerConnection</tt>.
+     *
+     * @param localStream the local <tt>MediaStream</tt> from the associated
+     * <tt>PeerConnection</tt>
+     * @return <tt>true</tt> if removing the specified <tt>mediaStream</tt> from
+     * this instance resulted in a modification of its internal list of local
+     * <tt>MediaStream</tt>s; otherwise, <tt>false</tt>
+     */
+    boolean removeStream(MediaStream localStream) {
+        if (peerConnection != null) {
+            peerConnection.removeStream(localStream);
+        }
+
+        return localStreams.remove(localStream);
     }
 
     PeerConnection getPeerConnection() {
@@ -66,14 +109,38 @@ class PeerConnectionObserver implements PeerConnection.Observer {
     }
 
     void close() {
-         peerConnection.close();
+        Log.d(TAG, "PeerConnection.close() for " + id);
 
-         remoteStreams.clear();
-         remoteTracks.clear();
+        // Close the PeerConnection first to stop any events.
+        peerConnection.close();
 
-         // Unlike on iOS, we cannot unregister the DataChannel.Observer
-         // instance on Android. At least do whatever else we do on iOS.
-         dataChannels.clear();
+        // PeerConnection.dispose() calls MediaStream.dispose() on all local
+        // MediaStreams added to it and the app may crash if a local MediaStream
+        // is added to multiple PeerConnections. In order to reduce the risks of
+        // an app crash, remove all local MediaStreams from the associated
+        // PeerConnection so that it doesn't attempt to dispose of them.
+        for (MediaStream localStream : new ArrayList<>(localStreams)) {
+            removeStream(localStream);
+        }
+
+        // Remove video track adapters
+        for (MediaStream stream : remoteStreams.values()) {
+            for (VideoTrack videoTrack : stream.videoTracks) {
+                videoTrackAdapters.removeAdapter(videoTrack);
+            }
+        }
+
+        // At this point there should be no local MediaStreams in the associated
+        // PeerConnection. Call dispose() to free all remaining resources held
+        // by the PeerConnection instance (RtpReceivers, RtpSenders, etc.)
+        peerConnection.dispose();
+
+        remoteStreams.clear();
+        remoteTracks.clear();
+
+        // Unlike on iOS, we cannot unregister the DataChannel.Observer
+        // instance on Android. At least do whatever else we do on iOS.
+        dataChannels.clear();
     }
 
     void createDataChannel(String label, ReadableMap config) {
@@ -99,10 +166,6 @@ class PeerConnectionObserver implements PeerConnection.Observer {
             }
         }
         DataChannel dataChannel = peerConnection.createDataChannel(label, init);
-        // XXX RTP data channels are not defined by the WebRTC standard, have
-        // been deprecated in Chromium, and Google have decided (in 2015) to no
-        // longer support them (in the face of multiple reported issues of
-        // breakages).
         int dataChannelId = init.id;
         if (-1 != dataChannelId) {
             dataChannels.put(dataChannelId, dataChannel);
@@ -145,22 +208,19 @@ class PeerConnectionObserver implements PeerConnection.Observer {
         }
     }
 
-    void getStats(String trackId, final Promise promise) {
+    @SuppressWarnings("deprecation") // TODO(saghul): getStats is deprecated.
+    void getStats(String trackId, final Callback cb) {
         MediaStreamTrack track = null;
         if (trackId == null
                 || trackId.isEmpty()
-                || (track = webRTCModule.localTracks.get(trackId)) != null
+                || (track = webRTCModule.getLocalTrack(trackId)) != null
                 || (track = remoteTracks.get(trackId)) != null) {
             peerConnection.getStats(
-                    new StatsObserver() {
-                        @Override
-                        public void onComplete(StatsReport[] reports) {
-                            promise.resolve(statsToJSON(reports));
-                        }
-                    },
+                reports -> cb.invoke(true, statsToJSON(reports)),
                     track);
         } else {
             Log.e(TAG, "peerConnectionGetStats() MediaStreamTrack not found for id: " + trackId);
+            cb.invoke(false, "Track not found");
         }
     }
 
@@ -278,13 +338,12 @@ class PeerConnectionObserver implements PeerConnection.Observer {
     @Override
     public void onAddStream(MediaStream mediaStream) {
         String streamReactTag = null;
-        String streamId = mediaStream.label();
+        String streamId = mediaStream.getId();
         // The native WebRTC implementation has a special concept of a default
         // MediaStream instance with the label default that the implementation
         // reuses.
         if ("default".equals(streamId)) {
-            for (Map.Entry<String, MediaStream> e
-                    : remoteStreams.entrySet()) {
+            for (Map.Entry<String, MediaStream> e : remoteStreams.entrySet()) {
                 if (e.getValue().equals(mediaStream)) {
                     streamReactTag = e.getKey();
                     break;
@@ -292,8 +351,8 @@ class PeerConnectionObserver implements PeerConnection.Observer {
             }
         }
 
-        if (streamReactTag == null){
-            streamReactTag = webRTCModule.getNextStreamUUID();
+        if (streamReactTag == null) {
+            streamReactTag = UUID.randomUUID().toString();
             remoteStreams.put(streamReactTag, mediaStream);
         }
 
@@ -318,6 +377,8 @@ class PeerConnectionObserver implements PeerConnection.Observer {
             trackInfo.putString("readyState", track.state().toString());
             trackInfo.putBoolean("remote", true);
             tracks.pushMap(trackInfo);
+
+            videoTrackAdapters.addAdapter(streamReactTag, track);
         }
         for (int i = 0; i < mediaStream.audioTracks.size(); i++) {
             AudioTrack track = mediaStream.audioTracks.get(i);
@@ -345,11 +406,12 @@ class PeerConnectionObserver implements PeerConnection.Observer {
         if (streamReactTag == null) {
             Log.w(TAG,
                 "onRemoveStream - no remote stream for id: "
-                    + mediaStream.label());
+                    + mediaStream.getId());
             return;
         }
 
         for (VideoTrack track : mediaStream.videoTracks) {
+            this.videoTrackAdapters.removeAdapter(track);
             this.remoteTracks.remove(track.id());
         }
         for (AudioTrack track : mediaStream.audioTracks) {
@@ -366,26 +428,7 @@ class PeerConnectionObserver implements PeerConnection.Observer {
 
     @Override
     public void onDataChannel(DataChannel dataChannel) {
-        // XXX Unfortunately, the Java WebRTC API doesn't expose the id
-        // of the underlying C++/native DataChannel (even though the
-        // WebRTC standard defines the DataChannel.id property). As a
-        // workaround, generated an id which will surely not clash with
-        // the ids of the remotely-opened (and standard-compliant
-        // locally-opened) DataChannels.
-        int dataChannelId = -1;
-        // The RTCDataChannel.id space is limited to unsigned short by
-        // the standard:
-        // https://www.w3.org/TR/webrtc/#dom-datachannel-id.
-        // Additionally, 65535 is reserved due to SCTP INIT and
-        // INIT-ACK chunks only allowing a maximum of 65535 streams to
-        // be negotiated (as defined by the WebRTC Data Channel
-        // Establishment Protocol).
-        for (int i = 65536; i <= Integer.MAX_VALUE; ++i) {
-            if (null == dataChannels.get(i, null)) {
-                dataChannelId = i;
-                break;
-            }
-        }
+        final int dataChannelId = dataChannel.id();
         if (-1 == dataChannelId) {
           return;
         }
